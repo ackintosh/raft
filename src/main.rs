@@ -1,5 +1,8 @@
 use std::net::{TcpListener, TcpStream};
 use std::io::Read;
+use std::time::{Instant, Duration};
+use std::sync::{Arc, RwLock};
+use std::ops::Add;
 
 // https://raft.github.io/raft.pdf
 fn main() {
@@ -8,6 +11,13 @@ fn main() {
     // When servers start up, they begins as followers
     let _server_state = ServerState::Follower;
     let _state = State::new();
+
+    let heartbeat_received_at = Arc::new(RwLock::new(Instant::now()));
+
+    let leader_election = LeaderElection::new(heartbeat_received_at.clone());
+    let _leader_election_handle = std::thread::spawn(move || {
+        leader_election.start();
+    });
 
     let mut rpc_handler = RpcHandler { port: "8080".to_owned() };
     rpc_handler.listen();
@@ -65,5 +75,36 @@ impl RpcHandler {
         let body = String::from_utf8_lossy(&buffer[..size]).to_string();
 
         println!("Rpc message body: {}", body);
+    }
+}
+
+struct LeaderElection {
+    election_timeout: Duration,
+    heartbeat_received_at: Arc<RwLock<Instant>>,
+}
+
+impl LeaderElection {
+    fn new(heartbeat_received_at: Arc<RwLock<Instant>>) -> Self {
+        Self {
+            election_timeout: Duration::from_secs(3), // TODO: Randomize per node
+            heartbeat_received_at,
+        }
+    }
+
+    fn start(self) {
+        loop {
+            let timeout = self.heartbeat_received_at
+                .read()
+                .unwrap()
+                .add(self.election_timeout);
+            let now = Instant::now();
+
+            if now > timeout {
+                // TODO
+                println!("Receives no communication over a period `election timeout`.");
+            } else {
+                std::thread::sleep(timeout - now);
+            }
+        }
     }
 }

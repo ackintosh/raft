@@ -6,7 +6,8 @@ fn main() {
     println!("Hello, Raft!");
 
     // When servers start up, they begins as followers
-    let _state = ServerState::Follower;
+    let _server_state = ServerState::Follower;
+    let _state = State::new();
 
     let mut rpc_handler = RpcHandler { port: "8080".to_owned() };
     rpc_handler.listen();
@@ -21,6 +22,28 @@ enum ServerState {
     Follower,
     Candidate,
     Leader,
+}
+
+// Persistent state on all servers
+// (Updated on stable storage before responding to RPCs)
+struct State {
+    // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+    current_term: u64,
+    // candidateId that received vote in current term (or null if none)
+    voted_for: Option<String>,
+    // log entries; each entry contains command for state machine,
+    // and term when entry was received by leader (first index is 1)
+    logs: Vec<String>,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            current_term: 0,
+            voted_for: None,
+            logs: vec![],
+        }
+    }
 }
 
 struct RpcHandler {

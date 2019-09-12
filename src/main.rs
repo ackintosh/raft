@@ -9,12 +9,15 @@ fn main() {
     println!("Hello, Raft!");
 
     // When servers start up, they begins as followers
-    let _server_state = ServerState::Follower;
+    let server_state = Arc::new(RwLock::new(ServerState::new()));
     let _state = State::new();
 
-    let heartbeat_received_at = Arc::new(RwLock::new(Instant::now()));
+    let heartbeat_received_at = Arc::new(RwLock::new(HeartbeatReceivedAt::new()));
 
-    let leader_election = LeaderElection::new(heartbeat_received_at.clone());
+    let leader_election = LeaderElection::new(
+        server_state.clone(),
+        heartbeat_received_at.clone()
+    );
     let _leader_election_handle = std::thread::spawn(move || {
         leader_election.start();
     });
@@ -23,12 +26,30 @@ fn main() {
     rpc_handler.listen();
 }
 
+struct ServerState {
+    value: ServerStateValue,
+}
+
+impl ServerState {
+    fn new() -> Self {
+        Self { value: ServerStateValue::Follower }
+    }
+
+    fn to_candidate(&mut self) {
+        assert!(self.value == ServerStateValue::Follower);
+
+        println!("Server state has been changed from Follower to Candidate");
+        self.value = ServerStateValue::Candidate;
+    }
+}
+
 // see Figure 4: Server states
 // - Followers only respond to requests from other servers.
 //   - If a follower receives no communication, it becomes a candidate and initiates an election.
 // - A candidate that receives votes from a majority of the full cluster becomes the new leader.
 // - Leaders typically operate until they fail.
-enum ServerState {
+#[derive(PartialEq)]
+enum ServerStateValue {
     Follower,
     Candidate,
     Leader,
@@ -79,13 +100,38 @@ impl RpcHandler {
 }
 
 struct LeaderElection {
+    server_state: Arc<RwLock<ServerState>>,
     election_timeout: Duration,
-    heartbeat_received_at: Arc<RwLock<Instant>>,
+    heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
+}
+
+struct HeartbeatReceivedAt {
+    value: Instant,
+}
+
+impl HeartbeatReceivedAt {
+    fn new() -> Self {
+        Self {
+            value: Instant::now()
+        }
+    }
+
+    fn add(&self, duration: Duration) -> Instant {
+        self.value.add(duration)
+    }
+
+    fn reset(&mut self) {
+        self.value = Instant::now();
+    }
 }
 
 impl LeaderElection {
-    fn new(heartbeat_received_at: Arc<RwLock<Instant>>) -> Self {
+    fn new(
+        server_state: Arc<RwLock<ServerState>>,
+        heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
+    ) -> Self {
         Self {
+            server_state,
             election_timeout: Duration::from_secs(3), // TODO: Randomize per node
             heartbeat_received_at,
         }
@@ -102,6 +148,10 @@ impl LeaderElection {
             if now > timeout {
                 // TODO
                 println!("Receives no communication over a period `election timeout`.");
+                self.server_state.write().unwrap().to_candidate();
+
+                println!("Reset the heartbeat_received_at");
+                self.heartbeat_received_at.write().unwrap().reset();
             } else {
                 std::thread::sleep(timeout - now);
             }

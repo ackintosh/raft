@@ -7,6 +7,10 @@ use std::ops::Add;
 // https://raft.github.io/raft.pdf
 fn main() {
     println!("Hello, Raft!");
+    let args: Vec<String> = std::env::args().collect();
+    println!("Command line args: {:?}", args);
+    let network = Network::new(&args);
+    println!("Network: {:?}", network);
 
     // When servers start up, they begins as followers
     let server_state = Arc::new(RwLock::new(ServerState::new()));
@@ -22,8 +26,23 @@ fn main() {
         leader_election.start();
     });
 
-    let mut rpc_handler = RpcHandler { port: "8080".to_owned() };
+    let mut rpc_handler = RpcHandler { network: &network };
     rpc_handler.listen();
+}
+
+#[derive(Debug)]
+struct Network {
+    port: String,
+    nodes: Box<[String]>,
+}
+
+impl Network {
+    fn new(args: &Vec<String>) -> Self {
+        Self {
+            port: args[1].clone(),
+            nodes: args[1..].to_vec().into_boxed_slice(),
+        }
+    }
 }
 
 struct ServerState {
@@ -77,13 +96,15 @@ impl State {
     }
 }
 
-struct RpcHandler {
-    port: String,
+struct RpcHandler<'a> {
+    network: &'a Network,
 }
 
-impl RpcHandler {
+impl RpcHandler<'_> {
     fn listen(&mut self) {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).unwrap();
+        let address = format!("127.0.0.1:{}", self.network.port);
+        println!("RpcHandler is listening on {}", address);
+        let listener = TcpListener::bind(address).unwrap();
 
         for stream in listener.incoming() {
             self.handle(&stream.unwrap());

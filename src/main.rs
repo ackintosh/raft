@@ -1,9 +1,8 @@
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::io::{Read, Write};
 use std::time::{Instant, Duration};
-use std::sync::{Arc, RwLock, Mutex, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::ops::Add;
-use std::os::ios::raw::stat;
 
 #[macro_use]
 extern crate serde_derive;
@@ -115,6 +114,10 @@ impl State {
     fn voted_for(&mut self, node_id: &String) {
         self.voted_for = Some(node_id.to_string())
     }
+
+    fn log_index(&self) -> u64 {
+        (self.logs.len() + 1) as u64
+    }
 }
 
 struct RpcHandler {
@@ -153,16 +156,52 @@ impl RpcHandler {
         let mut state = self.state
             .write().unwrap();
 
-        // TODO: verify the request_vote
+        let result = if self.verify_request_vote(
+            &state,
+            &request_vote
+        ) {
+            state.voted_for(&node_id(&stream.peer_addr().unwrap()));
 
-        state.voted_for(&node_id(&stream.peer_addr().unwrap()));
+            serde_json::to_string(&RequestVoteResult {
+                term: state.current_term,
+                vote_granted: true, // TODO
+            }).unwrap()
+        } else {
+            serde_json::to_string(&RequestVoteResult {
+                term: state.current_term,
+                vote_granted: false,
+            }).unwrap()
+        };
 
-        let result = serde_json::to_string(&RequestVoteResult {
-            term: state.current_term,
-            vote_granted: true, // TODO
-        }).unwrap();
         println!("request vote result: {:?}", result);
         stream.write(result.as_bytes()).unwrap();
+    }
+
+    fn verify_request_vote(
+        &self,
+        state: &RwLockWriteGuard<State>,
+        request_vote: &RequestVote
+    ) -> bool {
+        // Reply false if term < currentTerm (§5.1)
+        if request_vote.term < state.current_term {
+            return false;
+        }
+
+        // If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log,
+        // grant vote (§5.2, §5.4)
+        match &state.voted_for {
+            Some(candidate_id) => {
+                if candidate_id.to_string() != request_vote.candidate_id {
+                    println!("Rejected a request_vote as already voted to other candidate.");
+                    false
+                } else {
+                    request_vote.last_log_index >= state.log_index()
+                }
+            }
+            None => {
+                request_vote.last_log_index >= state.log_index()
+            }
+        }
     }
 }
 

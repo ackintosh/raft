@@ -44,7 +44,12 @@ fn main() {
         heartbeat.start();
     });
 
-    let mut rpc_handler = RpcHandler { state: state.clone(), network: network.clone() };
+    let mut rpc_handler = RpcHandler {
+        state: state.clone(),
+        server_state: server_state.clone(),
+        network: network.clone(),
+        heartbeat_received_at: heartbeat_received_at.clone(),
+    };
     rpc_handler.listen();
 }
 
@@ -98,6 +103,11 @@ impl ServerState {
         println!("Server state has been changed from Candidate to Leader");
         self.value = ServerStateValue::Leader;
     }
+
+    fn to_follower(&mut self) {
+        println!("Server state has been changed from {:?} to Follower", self.value);
+        self.value = ServerStateValue::Follower;
+    }
 }
 
 // see Figure 4: Server states
@@ -105,7 +115,7 @@ impl ServerState {
 //   - If a follower receives no communication, it becomes a candidate and initiates an election.
 // - A candidate that receives votes from a majority of the full cluster becomes the new leader.
 // - Leaders typically operate until they fail.
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum ServerStateValue {
     Follower,
     Candidate,
@@ -149,7 +159,9 @@ impl State {
 
 struct RpcHandler {
     state: Arc<RwLock<State>>,
+    server_state: Arc<RwLock<ServerState>>,
     network: Arc<Network>,
+    heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
 }
 
 impl RpcHandler {
@@ -173,7 +185,7 @@ impl RpcHandler {
         let message = RpcMessage::from(&body);
         match message.r#type {
             RpcMessageType::RequestVote => self.handle_request_vote(stream, &message),
-            RpcMessageType::AppendEntries => {} // TODO
+            RpcMessageType::AppendEntries => self.handle_append_entries(stream, &message),
         }
     }
 
@@ -229,6 +241,26 @@ impl RpcHandler {
                 request_vote.last_log_index >= state.log_index()
             }
         }
+    }
+
+    fn handle_append_entries(&self, mut strem: &TcpStream, message: &RpcMessage) {
+        let append_entries = AppendEntries::from(&message.payload);
+
+        let result = serde_json::to_string(&AppendEntriesResult {
+            term: 1, // TODO
+            success: self.verify_append_entries(&append_entries),
+        }).unwrap();
+
+        println!("AppendEntriesResult: {:?}", result);
+        strem.write(result.as_bytes()).unwrap();
+
+        self.server_state.write().unwrap().to_follower();
+        self.heartbeat_received_at.write().unwrap().reset();
+    }
+
+    fn verify_append_entries(&self, _append_entries: &AppendEntries) -> bool {
+        // TODO
+        true
     }
 }
 
@@ -343,12 +375,25 @@ impl AppendEntries {
             leader_commit: 0, // TODO
         }
     }
+
+    fn from(str: &String) -> Self {
+        serde_json::from_str(str).unwrap()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AppendEntriesResult {
+    // currentTerm, for leader to update itself
     term: u64,
+    // true if follower contained entry matching prevLogIndex and prevLogTerm
     success: bool,
+}
+
+impl AppendEntriesResult {
+    fn from(bytes: &[u8]) -> Self {
+        let str = String::from_utf8_lossy(bytes).to_string();
+        serde_json::from_str(&str).unwrap()
+    }
 }
 
 struct LeaderElection {
@@ -376,6 +421,7 @@ impl HeartbeatReceivedAt {
     }
 
     fn reset(&mut self) {
+        println!("HeartbeatReceivedAt has been updated");
         self.value = Instant::now();
     }
 }
@@ -506,7 +552,9 @@ impl Heartbeat {
 
     fn send_heartbeat(&self, node: &String, message: &[u8]) -> Result<(), String> {
         match send_message(node, message) {
-            Ok(_res) => {
+            Ok(res) => {
+                let result = AppendEntriesResult::from(&res);
+                println!("AppendEntriesResult: {:?}", result);
                 Ok(())
             }
             Err(e) => {

@@ -1,7 +1,7 @@
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::io::{Read, Write};
 use std::time::{Instant, Duration};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex, RwLockWriteGuard};
 use std::ops::Add;
 
 #[macro_use]
@@ -14,12 +14,12 @@ fn main() {
     println!("Command line args: {:?}", args);
     let network = Arc::new(Network::new(&args));
     println!("Network: {:?}", network);
-    let node_id = Arc::new(format!("node_{}", network.port));
+    let node_id = Arc::new(format!("node_{}_{}", "127.0.0.1", network.port));
     println!("NodeId: {:?}", node_id);
 
     // When servers start up, they begins as followers
     let server_state = Arc::new(RwLock::new(ServerState::new()));
-    let state = Arc::new(State::new());
+    let state = Arc::new(RwLock::new(State::new()));
 
     let heartbeat_received_at = Arc::new(RwLock::new(HeartbeatReceivedAt::new()));
 
@@ -34,8 +34,12 @@ fn main() {
         leader_election.start();
     });
 
-    let mut rpc_handler = RpcHandler { network: network.clone() };
+    let mut rpc_handler = RpcHandler { state: state.clone(), network: network.clone() };
     rpc_handler.listen();
+}
+
+fn node_id(socket_addr: &SocketAddr) -> String {
+    format!("node_{}_{}", socket_addr.ip().to_string(), socket_addr.port())
 }
 
 #[derive(Debug)]
@@ -102,9 +106,18 @@ impl State {
             logs: vec![],
         }
     }
+
+    fn increment_term(&mut self) {
+        self.current_term += 1;
+    }
+
+    fn voted_for(&mut self, node_id: &String) {
+        self.voted_for = Some(node_id.to_string())
+    }
 }
 
 struct RpcHandler {
+    state: Arc<RwLock<State>>,
     network: Arc<Network>,
 }
 
@@ -124,8 +137,28 @@ impl RpcHandler {
         let size = stream.read(&mut buffer).unwrap();
         let body = String::from_utf8_lossy(&buffer[..size]).to_string();
 
-        // TODO
         println!("Rpc message body: {}", body);
+
+        let message = RpcMessage::from(&body);
+        match message.r#type {
+            RpcMessageType::RequestVote => self.handle_request_vote(stream, &message),
+            RpcMessageType::AppendEntries => {} // TODO
+        }
+    }
+
+    fn handle_request_vote(&self, mut stream: &TcpStream,  message: &RpcMessage) {
+        let request_vote = RequestVote::from(&message.payload);
+
+        self.state
+            .write().unwrap()
+            .voted_for(&node_id(&stream.peer_addr().unwrap()));
+
+        let result = serde_json::to_string(&RequestVoteResult {
+            term: 1, // TODO
+            vote_granted: true, // TODO
+        }).unwrap();
+        println!("request vote result: {:?}", result);
+        stream.write(result.as_bytes()).unwrap();
     }
 }
 
@@ -136,7 +169,7 @@ struct RpcMessage {
 }
 
 impl RpcMessage {
-    fn create_request_vote(node_id: Arc<String>, state: Arc<State>) -> Self {
+    fn create_request_vote(node_id: String, state: &RwLockWriteGuard<State>) -> Self {
         let payload = serde_json::to_string(&RequestVote::new(node_id, state)).unwrap();
 
         Self {
@@ -147,6 +180,10 @@ impl RpcMessage {
 
     fn to_string(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn from(str: &String) -> Self {
+        serde_json::from_str(str).unwrap()
     }
 }
 
@@ -171,7 +208,7 @@ struct RequestVote {
 }
 
 impl RequestVote {
-    fn new(node_id: Arc<String>, state: Arc<State>) -> Self {
+    fn new(node_id: String, state: &RwLockWriteGuard<State>) -> Self {
         Self {
             term: state.current_term,
             candidate_id: node_id.to_string(),
@@ -179,12 +216,31 @@ impl RequestVote {
             last_log_term: 1, // TODO
         }
     }
+
+    fn from(str: &String) -> Self {
+        serde_json::from_str(str).unwrap()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RequestVoteResult {
+    // currentTerm, for candidate to update itself
+    term: u64,
+    // true means candidate received vote
+    vote_granted: bool,
+}
+
+impl RequestVoteResult {
+    fn from(bytes: &[u8]) -> Self {
+        let str = String::from_utf8_lossy(bytes).to_string();
+        serde_json::from_str(&str).unwrap()
+    }
 }
 
 struct LeaderElection {
     node_id: Arc<String>,
     network: Arc<Network>,
-    state: Arc<State>,
+    state: Arc<RwLock<State>>,
     server_state: Arc<RwLock<ServerState>>,
     election_timeout: Duration,
     heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
@@ -214,7 +270,7 @@ impl LeaderElection {
     fn new(
         node_id: Arc<String>,
         network: Arc<Network>,
-        state: Arc<State>,
+        state: Arc<RwLock<State>>,
         server_state: Arc<RwLock<ServerState>>,
         heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
     ) -> Self {
@@ -238,7 +294,6 @@ impl LeaderElection {
 
             if now > timeout {
                 println!("Receives no communication over a period `election timeout`.");
-                self.server_state.write().unwrap().to_candidate();
 
                 self.start_election();
                 println!("Reset the heartbeat_received_at");
@@ -251,9 +306,15 @@ impl LeaderElection {
 
     fn start_election(&self) {
         println!("The election has been started");
+        // To begin an election, a follower increments its current term and transitions to candidate state.
+        let mut state = self.state.write().unwrap();
+        state.increment_term();
+        state.voted_for(&self.node_id);
+        self.server_state.write().unwrap().to_candidate();
+
         let message = RpcMessage::create_request_vote(
-            self.node_id.clone(),
-            self.state.clone()
+            self.node_id.to_string(),
+            &state
         ).to_string();
 
         for node in self.network.nodes.iter() {
@@ -269,7 +330,18 @@ impl LeaderElection {
                 match stream.write(message) {
                     Ok(size) => {
                         println!("Sent {} bytes", size);
-                        Ok(())
+
+                        let mut buffer = [0u8; 512];
+                        match stream.read(&mut buffer) {
+                            Ok(size) => {
+                                let result = RequestVoteResult::from(&buffer[..size]);
+                                println!("{:?}", result);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                Err(format!("Failed to read the response: {:?}", e))
+                            }
+                        }
                     }
                     Err(e) => {
                         Err(format!("Failed to RequestVote RPC: {:?}", e))

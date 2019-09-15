@@ -116,6 +116,7 @@ impl State {
     }
 
     fn log_index(&self) -> u64 {
+        // first index is 1
         (self.logs.len() + 1) as u64
     }
 }
@@ -255,7 +256,7 @@ impl RequestVote {
         Self {
             term: state.current_term,
             candidate_id: node_id.to_string(),
-            last_log_index: (state.logs.len() + 1) as u64,
+            last_log_index: state.log_index(),
             last_log_term: 1, // TODO
         }
     }

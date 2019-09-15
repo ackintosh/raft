@@ -1,7 +1,7 @@
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::io::{Read, Write};
 use std::time::{Instant, Duration};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockWriteGuard, RwLockReadGuard};
 use std::ops::Add;
 
 #[macro_use]
@@ -34,6 +34,16 @@ fn main() {
         leader_election.start();
     });
 
+    let heartbeat = Heartbeat {
+        node_id: node_id.clone(),
+        network: network.clone(),
+        state: state.clone(),
+        server_state: server_state.clone(),
+    };
+    let _heartbeat_handle = std::thread::spawn(move || {
+        heartbeat.start();
+    });
+
     let mut rpc_handler = RpcHandler { state: state.clone(), network: network.clone() };
     rpc_handler.listen();
 }
@@ -46,14 +56,23 @@ fn node_id(socket_addr: &SocketAddr) -> String {
 struct Network {
     port: String,
     nodes: Box<[String]>,
+    majority: i32,
 }
 
 impl Network {
     fn new(args: &Vec<String>) -> Self {
+        let nodes = args[2..].to_vec().into_boxed_slice();
+        let majority = math::round::ceil((&nodes.len() + 1) as f64 / 2f64, 0) as i32;
+
         Self {
             port: args[1].clone(),
-            nodes: args[2..].to_vec().into_boxed_slice(),
+            nodes,
+            majority,
         }
+    }
+
+    fn is_majority(&self, i: i32) -> bool {
+        i >= self.majority
     }
 }
 
@@ -71,6 +90,13 @@ impl ServerState {
 
         println!("Server state has been changed from Follower to Candidate");
         self.value = ServerStateValue::Candidate;
+    }
+
+    fn to_leader(&mut self) {
+        assert!(self.value == ServerStateValue::Candidate);
+
+        println!("Server state has been changed from Candidate to Leader");
+        self.value = ServerStateValue::Leader;
     }
 }
 
@@ -222,6 +248,15 @@ impl RpcMessage {
         }
     }
 
+    fn create_heartbeat(node_id: String, state: &RwLockReadGuard<State>) -> Self {
+        let payload = serde_json::to_string(&AppendEntries::new(node_id, state)).unwrap();
+
+        Self {
+            r#type: RpcMessageType::AppendEntries,
+            payload,
+        }
+    }
+
     fn to_string(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
@@ -281,6 +316,41 @@ impl RequestVoteResult {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct AppendEntries {
+    // leader's term
+    term: u64,
+    // so follower can redirect clients
+    leader_id: String,
+    // index of log entry immediately proceeding new ones
+    prev_log_index: u64,
+    // term of prevLogIndex entry
+    prev_log_term: u64,
+    // log entries to store (empty for heartbeat; may send more than one for efficiency)
+    entries: Vec<String>,
+    // leader's commitIndex
+    leader_commit: u64,
+}
+
+impl AppendEntries {
+    fn new(node_id: String, state: &RwLockReadGuard<State>) -> Self {
+        Self {
+            term: state.current_term,
+            leader_id: node_id.to_string(),
+            prev_log_index: 0, // TODO
+            prev_log_term: 0, // TODO
+            entries: vec![],
+            leader_commit: 0, // TODO
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AppendEntriesResult {
+    term: u64,
+    success: bool,
+}
+
 struct LeaderElection {
     node_id: Arc<String>,
     network: Arc<Network>,
@@ -330,6 +400,11 @@ impl LeaderElection {
 
     fn start(&self) {
         loop {
+            if self.server_state.read().unwrap().value != ServerStateValue::Follower {
+                std::thread::sleep(self.election_timeout);
+                continue;
+            }
+
             let timeout = self.heartbeat_received_at
                 .read()
                 .unwrap()
@@ -339,7 +414,11 @@ impl LeaderElection {
             if now > timeout {
                 println!("Receives no communication over a period `election timeout`.");
 
-                self.start_election();
+                if self.start_election() {
+                    println!("Received votes from a majority of the servers in the full cluster for the same term.");
+                    self.server_state.write().unwrap().to_leader();
+                }
+
                 println!("Reset the heartbeat_received_at");
                 self.heartbeat_received_at.write().unwrap().reset();
             } else {
@@ -348,7 +427,7 @@ impl LeaderElection {
         }
     }
 
-    fn start_election(&self) {
+    fn start_election(&self) -> bool {
         println!("The election has been started");
         // To begin an election, a follower increments its current term and transitions to candidate state.
         let mut state = self.state.write().unwrap();
@@ -361,40 +440,108 @@ impl LeaderElection {
             &state
         ).to_string();
 
+        let mut granted_count = 0;
         for node in self.network.nodes.iter() {
-            self.request_vote(node, message.as_bytes());
+            match self.send_request_vote(node, message.as_bytes()) {
+                Ok(granted) => {
+                    if granted {
+                        granted_count += 1;
+                        println!("RequestVote is granted.")
+                    } else {
+                        println!("RequestVote has not granted.")
+                    }
+                }
+                Err(e) => println!("{:?}", e)
+            }
+
+            if self.network.is_majority(granted_count) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fn send_request_vote(&self, node: &String, message: &[u8]) -> Result<bool, String> {
+        match send_message(node, message) {
+            Ok(res) => {
+                let result = RequestVoteResult::from(&res);
+                println!("RequestVoteResult: {:?}", result);
+                Ok(result.vote_granted)
+            }
+            Err(e) => {
+                Err(format!("Failed to read the RequestVoteResult: {:?}", e))
+            }
+        }
+    }
+}
+
+struct Heartbeat {
+    node_id: Arc<String>,
+    network: Arc<Network>,
+    state: Arc<RwLock<State>>,
+    server_state: Arc<RwLock<ServerState>>,
+}
+
+impl Heartbeat {
+    fn start(&self) {
+        loop {
+            // FIXME
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            if self.server_state.read().unwrap().value != ServerStateValue::Leader {
+                continue;
+            }
+
+            let message = RpcMessage::create_heartbeat(
+                self.node_id.to_string(),
+                &self.state.read().unwrap(),
+            ).to_string();
+
+            for node in self.network.nodes.iter() {
+                self.send_heartbeat(&node, message.as_bytes());
+            }
         }
     }
 
-    fn request_vote(&self, node: &String, message: &[u8]) -> Result<(), String> {
-        match TcpStream::connect(format!("127.0.0.1:{}", node)) {
-            Ok(mut stream) => {
-                println!("Successfully connected to the node: {:?}", node);
-
-                match stream.write(message) {
-                    Ok(size) => {
-                        println!("Sent {} bytes", size);
-
-                        let mut buffer = [0u8; 512];
-                        match stream.read(&mut buffer) {
-                            Ok(size) => {
-                                let result = RequestVoteResult::from(&buffer[..size]);
-                                println!("{:?}", result);
-                                Ok(())
-                            }
-                            Err(e) => {
-                                Err(format!("Failed to read the response: {:?}", e))
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        Err(format!("Failed to RequestVote RPC: {:?}", e))
-                    }
-                }
+    fn send_heartbeat(&self, node: &String, message: &[u8]) -> Result<(), String> {
+        match send_message(node, message) {
+            Ok(_res) => {
+                Ok(())
             }
             Err(e) => {
-                Err(format!("Failed to connect to the node: {:?}, error: {:?}", node, e))
+                Err(format!("Failed to read the AppendEntriesResult: {:?}", e))
             }
+        }
+    }
+}
+
+fn send_message(node: &String, message: &[u8]) -> Result<Box<[u8]>, String> {
+    match TcpStream::connect(format!("127.0.0.1:{}", node)) {
+        Ok(mut stream) => {
+            println!("Successfully connected to the node: {:?}", node);
+
+            match stream.write(message) {
+                Ok(size) => {
+                    println!("Sent {} bytes", size);
+
+                    let mut buffer = [0u8; 512];
+                    match stream.read(&mut buffer) {
+                        Ok(size) => {
+                            Ok(buffer[..size].to_vec().into_boxed_slice())
+                        }
+                        Err(e) => {
+                            Err(format!("Failed to read the response: {:?}", e))
+                        }
+                    }
+                }
+                Err(e) => {
+                    Err(format!("Failed to RequestVote RPC: {:?}", e))
+                }
+            }
+        }
+        Err(e) => {
+            Err(format!("Failed to connect to the node: {:?}, error: {:?}", node, e))
         }
     }
 }

@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::time::{Instant, Duration};
 use std::sync::{Arc, RwLock, Mutex, RwLockWriteGuard};
 use std::ops::Add;
+use std::os::ios::raw::stat;
 
 #[macro_use]
 extern crate serde_derive;
@@ -149,12 +150,15 @@ impl RpcHandler {
     fn handle_request_vote(&self, mut stream: &TcpStream,  message: &RpcMessage) {
         let request_vote = RequestVote::from(&message.payload);
 
-        self.state
-            .write().unwrap()
-            .voted_for(&node_id(&stream.peer_addr().unwrap()));
+        let mut state = self.state
+            .write().unwrap();
+
+        // TODO: verify the request_vote
+
+        state.voted_for(&node_id(&stream.peer_addr().unwrap()));
 
         let result = serde_json::to_string(&RequestVoteResult {
-            term: 1, // TODO
+            term: state.current_term,
             vote_granted: true, // TODO
         }).unwrap();
         println!("request vote result: {:?}", result);

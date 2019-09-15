@@ -130,6 +130,35 @@ impl RpcHandler {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct RpcMessage {
+    r#type: RpcMessageType,
+    payload: String,
+}
+
+impl RpcMessage {
+    fn create_request_vote(node_id: Arc<String>, state: Arc<State>) -> Self {
+        let payload = serde_json::to_string(&RequestVote::new(node_id, state)).unwrap();
+
+        Self {
+            r#type: RpcMessageType::RequestVote,
+            payload,
+        }
+    }
+
+    fn to_string(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum RpcMessageType {
+    // Invoked by candidates to gather votes.
+    RequestVote,
+    // Invoked by leader to replicate log entries; also used as heartbeat.
+    AppendEntries,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct RequestVote {
     // candidate's term
     term: u64,
@@ -222,12 +251,11 @@ impl LeaderElection {
 
     fn start_election(&self) {
         println!("The election has been started");
-        let message = serde_json::to_string(
-            &RequestVote::new(
-                self.node_id.clone(),
-                self.state.clone()
-            ))
-            .unwrap();
+        let message = RpcMessage::create_request_vote(
+            self.node_id.clone(),
+            self.state.clone()
+        ).to_string();
+
         for node in self.network.nodes.iter() {
             self.request_vote(node, message.as_bytes());
         }

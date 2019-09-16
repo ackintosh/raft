@@ -247,10 +247,12 @@ impl RpcHandler {
                     false
                 } else {
                     request_vote.last_log_index >= state.log_index()
+                        && request_vote.last_log_term >= state.log_term()
                 }
             }
             None => {
                 request_vote.last_log_index >= state.log_index()
+                    && request_vote.last_log_term >= state.log_term()
             }
         }
     }

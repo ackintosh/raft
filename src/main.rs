@@ -47,8 +47,10 @@ fn main() {
     });
 
     let mut rpc_handler = RpcHandler {
+        node_id: node_id.clone(),
         state: state.clone(),
         server_state: server_state.clone(),
+        volatile_state: volatile_state.clone(),
         network: network.clone(),
         heartbeat_received_at: heartbeat_received_at.clone(),
     };
@@ -159,6 +161,11 @@ impl State {
         self.voted_for = Some(node_id.to_string())
     }
 
+    fn append_log(&mut self, log: Log) {
+        println!("logs has been appended with the log: {:?}", log);
+        self.logs.push(log);
+    }
+
     fn log_index(&self) -> u64 {
         // first index is 1
         self.logs.len() as u64
@@ -190,14 +197,17 @@ impl VolatileState {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Log {
     term: u64,
     command: String,
 }
 
 struct RpcHandler {
+    node_id: Arc<String>,
     state: Arc<RwLock<State>>,
     server_state: Arc<RwLock<ServerState>>,
+    volatile_state: Arc<RwLock<VolatileState>>,
     network: Arc<Network>,
     heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
 }
@@ -224,6 +234,7 @@ impl RpcHandler {
         match message.r#type {
             RpcMessageType::RequestVote => self.handle_request_vote(stream, &message),
             RpcMessageType::AppendEntries => self.handle_append_entries(stream, &message),
+            RpcMessageType::StateMachineCommand => self.handle_state_machine_command(stream, &message),
         }
     }
 
@@ -322,6 +333,45 @@ impl RpcHandler {
 
         true
     }
+
+    fn handle_state_machine_command(&self, mut stream: &TcpStream, message: &RpcMessage) {
+        if self.server_state.read().unwrap().value != ServerStateValue::Leader {
+            let rep = "Received StateMachineCommand but leader is other node in currentTerm";
+            println!("{}", rep);
+            stream.write(rep.as_bytes()).unwrap();
+            return;
+        }
+
+        // If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
+        let mut state = self.state.write().unwrap();
+        let log = Log { term: state.current_term, command: message.payload.clone() };
+        state.append_log(log.clone());
+
+        let message = RpcMessage::create_append_entries(
+            self.node_id.to_string(),
+            &state,
+            &self.volatile_state.read().unwrap(),
+            log
+        ).to_string();
+
+        for node in self.network.nodes.iter() {
+            // TODO: send the requests in parallel
+            self.send_append_entries(node, message.as_bytes());
+        }
+    }
+
+    fn send_append_entries(&self, node: &String, message: &[u8]) -> Result<(), String>{
+        match send_message(node, message) {
+            Ok(res) => {
+                let result = AppendEntriesResult::from(&res);
+                println!("AppendEntriesResult: {:?}", result);
+                Ok(())
+            }
+            Err(e) => {
+                Err(format!("Failed to read the AppendEntriesResult: {:?}", e))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -345,7 +395,39 @@ impl RpcMessage {
         state: &RwLockReadGuard<State>,
         volatile_state: &RwLockReadGuard<VolatileState>
     ) -> Self {
-        let payload = serde_json::to_string(&AppendEntries::new(node_id, state, volatile_state)).unwrap();
+        let payload = serde_json::to_string(
+            &AppendEntries::new(
+                node_id,
+                state.current_term,
+                state.log_index(),
+                state.log_term(),
+                volatile_state,
+                vec![]
+            )
+        ).unwrap();
+
+        Self {
+            r#type: RpcMessageType::AppendEntries,
+            payload,
+        }
+    }
+
+    fn create_append_entries(
+        node_id: String,
+        state: &RwLockWriteGuard<State>,
+        volatile_state: &RwLockReadGuard<VolatileState>,
+        log: Log
+    ) -> Self {
+        let payload = serde_json::to_string(
+            &AppendEntries::new(
+                node_id,
+                state.current_term,
+                state.log_index(),
+                state.log_term(),
+                volatile_state,
+                vec![log]
+            )
+        ).unwrap();
 
         Self {
             r#type: RpcMessageType::AppendEntries,
@@ -368,6 +450,8 @@ enum RpcMessageType {
     RequestVote,
     // Invoked by leader to replicate log entries; also used as heartbeat.
     AppendEntries,
+    // Invoked by client to apply a command.
+    StateMachineCommand,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -423,7 +507,7 @@ struct AppendEntries {
     // term of prevLogIndex entry
     prev_log_term: u64,
     // log entries to store (empty for heartbeat; may send more than one for efficiency)
-    entries: Vec<String>,
+    entries: Vec<Log>,
     // leader's commitIndex
     leader_commit: u64,
 }
@@ -431,15 +515,18 @@ struct AppendEntries {
 impl AppendEntries {
     fn new(
         node_id: String,
-        state: &RwLockReadGuard<State>,
-        volatile_state: &RwLockReadGuard<VolatileState>
+        term: u64,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        volatile_state: &RwLockReadGuard<VolatileState>,
+        entries: Vec<Log>
     ) -> Self {
         Self {
-            term: state.current_term,
-            leader_id: node_id.to_string(),
-            prev_log_index: state.log_index(),
-            prev_log_term: state.log_term(),
-            entries: vec![],
+            term,
+            leader_id: node_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
             leader_commit: volatile_state.commit_index,
         }
     }
@@ -556,6 +643,7 @@ impl LeaderElection {
 
         let mut granted_count = 0;
         for node in self.network.nodes.iter() {
+            // TODO: send the requests in parallel
             match self.send_request_vote(node, message.as_bytes()) {
                 Ok(granted) => {
                     if granted {

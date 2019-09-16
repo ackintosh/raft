@@ -161,9 +161,13 @@ impl State {
         self.voted_for = Some(node_id.to_string())
     }
 
-    fn append_log(&mut self, log: Log) {
+    fn append_log(&mut self, log: Vec<Log>) {
         println!("logs has been appended with the log: {:?}", log);
-        self.logs.push(log);
+        for l in log.iter() {
+            self.logs.push(l.clone());
+        }
+
+        println!("state.logs: {:?}", self.logs);
     }
 
     fn log_index(&self) -> u64 {
@@ -304,24 +308,30 @@ impl RpcHandler {
     fn handle_append_entries(&self, mut strem: &TcpStream, message: &RpcMessage) {
         let append_entries = AppendEntries::from(&message.payload);
 
+        let is_valid = self.verify_append_entries(&append_entries);
+
+        let mut state = self.state.write().unwrap();
+
+        if is_valid {
+            // Rules for Servers:
+            // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+            if append_entries.term > state.current_term {
+                state.update_term(append_entries.term);
+                self.server_state.write().unwrap().to_follower();
+            }
+
+            state.append_log(append_entries.entries);
+
+            self.heartbeat_received_at.write().unwrap().reset();
+        }
+
         let result = serde_json::to_string(&AppendEntriesResult {
-            term: 1, // TODO
-            success: self.verify_append_entries(&append_entries),
+            term: state.current_term,
+            success: is_valid,
         }).unwrap();
 
         println!("AppendEntriesResult: {:?}", result);
         strem.write(result.as_bytes()).unwrap();
-
-        let mut state = self.state.write().unwrap();
-
-        // Rules for Servers:
-        // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
-        if append_entries.term > state.current_term {
-            state.update_term(append_entries.term);
-            self.server_state.write().unwrap().to_follower();
-        }
-
-        self.heartbeat_received_at.write().unwrap().reset();
     }
 
     fn verify_append_entries(&self, append_entries: &AppendEntries) -> bool {
@@ -345,7 +355,7 @@ impl RpcHandler {
         // If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
         let mut state = self.state.write().unwrap();
         let log = Log { term: state.current_term, command: message.payload.clone() };
-        state.append_log(log.clone());
+        state.append_log(vec![log.clone()]);
 
         let message = RpcMessage::create_append_entries(
             self.node_id.to_string(),

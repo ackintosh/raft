@@ -144,7 +144,13 @@ impl State {
     }
 
     fn increment_term(&mut self) {
+        println!("currentTerm has been increased from {} to {}", self.current_term, self.current_term + 1);
         self.current_term += 1;
+    }
+
+    fn update_term(&mut self, term: u64) {
+        println!("currentTerm has been updated from {} to {}", self.current_term, term);
+        self.current_term = term;
     }
 
     fn voted_for(&mut self, node_id: &String) {
@@ -167,6 +173,7 @@ impl State {
 
 struct Log {
     term: u64,
+    command: String,
 }
 
 struct RpcHandler {
@@ -212,6 +219,13 @@ impl RpcHandler {
             &request_vote
         ) {
             state.voted_for(&node_id(&stream.peer_addr().unwrap()));
+
+            // Rules for Servers:
+            // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+            if request_vote.term > state.current_term {
+                state.update_term(request_vote.term);
+                self.server_state.write().unwrap().to_follower();
+            }
 
             serde_json::to_string(&RequestVoteResult {
                 term: state.current_term,
@@ -268,12 +282,25 @@ impl RpcHandler {
         println!("AppendEntriesResult: {:?}", result);
         strem.write(result.as_bytes()).unwrap();
 
-        self.server_state.write().unwrap().to_follower();
+        let mut state = self.state.write().unwrap();
+
+        // Rules for Servers:
+        // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+        if append_entries.term > state.current_term {
+            state.update_term(append_entries.term);
+            self.server_state.write().unwrap().to_follower();
+        }
+
         self.heartbeat_received_at.write().unwrap().reset();
     }
 
-    fn verify_append_entries(&self, _append_entries: &AppendEntries) -> bool {
-        // TODO
+    fn verify_append_entries(&self, append_entries: &AppendEntries) -> bool {
+        let state = self.state.read().unwrap();
+        // Reply false if term < currentTerm (§5.1)
+        if append_entries.term < state.current_term {
+            return false
+        }
+
         true
     }
 }
@@ -383,8 +410,8 @@ impl AppendEntries {
         Self {
             term: state.current_term,
             leader_id: node_id.to_string(),
-            prev_log_index: 0, // TODO
-            prev_log_term: 0, // TODO
+            prev_log_index: state.log_index(),
+            prev_log_term: state.log_term(),
             entries: vec![],
             leader_commit: 0, // TODO
         }

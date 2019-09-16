@@ -20,6 +20,7 @@ fn main() {
     // When servers start up, they begins as followers
     let server_state = Arc::new(RwLock::new(ServerState::new()));
     let state = Arc::new(RwLock::new(State::new()));
+    let volatile_state = Arc::new(RwLock::new(VolatileState::new()));
 
     let heartbeat_received_at = Arc::new(RwLock::new(HeartbeatReceivedAt::new()));
 
@@ -39,6 +40,7 @@ fn main() {
         network: network.clone(),
         state: state.clone(),
         server_state: server_state.clone(),
+        volatile_state: volatile_state.clone(),
     };
     let _heartbeat_handle = std::thread::spawn(move || {
         heartbeat.start();
@@ -167,6 +169,23 @@ impl State {
             0
         } else {
             self.logs.last().unwrap().term
+        }
+    }
+}
+
+// Volatile state on all servers
+struct VolatileState {
+    // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+    commit_index: u64,
+    // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+    last_applied: u64,
+}
+
+impl VolatileState {
+    fn new() -> Self {
+        Self {
+            commit_index: 0,
+            last_applied: 0,
         }
     }
 }
@@ -321,8 +340,12 @@ impl RpcMessage {
         }
     }
 
-    fn create_heartbeat(node_id: String, state: &RwLockReadGuard<State>) -> Self {
-        let payload = serde_json::to_string(&AppendEntries::new(node_id, state)).unwrap();
+    fn create_heartbeat(
+        node_id: String,
+        state: &RwLockReadGuard<State>,
+        volatile_state: &RwLockReadGuard<VolatileState>
+    ) -> Self {
+        let payload = serde_json::to_string(&AppendEntries::new(node_id, state, volatile_state)).unwrap();
 
         Self {
             r#type: RpcMessageType::AppendEntries,
@@ -406,14 +429,18 @@ struct AppendEntries {
 }
 
 impl AppendEntries {
-    fn new(node_id: String, state: &RwLockReadGuard<State>) -> Self {
+    fn new(
+        node_id: String,
+        state: &RwLockReadGuard<State>,
+        volatile_state: &RwLockReadGuard<VolatileState>
+    ) -> Self {
         Self {
             term: state.current_term,
             leader_id: node_id.to_string(),
             prev_log_index: state.log_index(),
             prev_log_term: state.log_term(),
             entries: vec![],
-            leader_commit: 0, // TODO
+            leader_commit: volatile_state.commit_index,
         }
     }
 
@@ -568,6 +595,7 @@ struct Heartbeat {
     network: Arc<Network>,
     state: Arc<RwLock<State>>,
     server_state: Arc<RwLock<ServerState>>,
+    volatile_state: Arc<RwLock<VolatileState>>,
 }
 
 impl Heartbeat {
@@ -583,6 +611,7 @@ impl Heartbeat {
             let message = RpcMessage::create_heartbeat(
                 self.node_id.to_string(),
                 &self.state.read().unwrap(),
+                &self.volatile_state.read().unwrap()
             ).to_string();
 
             for node in self.network.nodes.iter() {

@@ -131,7 +131,7 @@ struct State {
     voted_for: Option<String>,
     // log entries; each entry contains command for state machine,
     // and term when entry was received by leader (first index is 1)
-    logs: Vec<String>,
+    logs: Vec<Log>,
 }
 
 impl State {
@@ -153,8 +153,20 @@ impl State {
 
     fn log_index(&self) -> u64 {
         // first index is 1
-        (self.logs.len() + 1) as u64
+        self.logs.len() as u64
     }
+
+    fn log_term(&self) -> u64 {
+        if self.logs.is_empty() {
+            0
+        } else {
+            self.logs.last().unwrap().term
+        }
+    }
+}
+
+struct Log {
+    term: u64,
 }
 
 struct RpcHandler {
@@ -312,9 +324,9 @@ struct RequestVote {
     term: u64,
     // candidate requesting vote
     candidate_id: String,
-    // index of candidate's last log entry
+    // index of candidate's last log entry (§5.4)
     last_log_index: u64,
-    // term of candidate's log entry
+    // term of candidate's log entry (§5.4)
     last_log_term: u64,
 }
 
@@ -324,7 +336,7 @@ impl RequestVote {
             term: state.current_term,
             candidate_id: node_id.to_string(),
             last_log_index: state.log_index(),
-            last_log_term: 1, // TODO
+            last_log_term: state.log_term(),
         }
     }
 

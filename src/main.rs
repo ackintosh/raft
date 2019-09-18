@@ -252,6 +252,12 @@ impl VolatileState {
         println!("commitIndex has been updated from {} to {}", self.commit_index, i);
         self.commit_index = i;
     }
+
+    fn update_last_applied(&mut self, log: &Log) {
+        assert_eq!(log.index, self.last_applied + 1);
+        println!("lastApplied has been updated from {} to {}", self.last_applied, log.index);
+        self.last_applied = log.index;
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -449,18 +455,34 @@ impl RpcHandler {
             self.node_id.to_string(),
             &state,
             &volatile_state,
-            log
+            log.clone()
         ).to_string();
 
         for node in self.network.nodes.iter() {
             // TODO: send the requests in parallel
             self.send_append_entries(node, message.as_bytes());
         }
+
+        // When the entry has been safely replicated, the leader applies the entry to its state machine and returns the result of that execution to the client.
+
+        // TODO: A log entry is committed once the leader that created the entry the entry has replicated it on a majority of the servers.
+
+        // NOTE:
+        // Suppose the leader applies the command to its state machine like below:
+        // state_machine.apply(log.command)
+
+        volatile_state.update_last_applied(&log);
+        stream.write("OK\n".as_bytes()).unwrap();
     }
 
     fn send_append_entries(&self, node: &String, message: &[u8]) -> Result<(), String>{
         match send_message(node, message) {
             Ok(res) => {
+                // TODO:
+                // 5.3 Log replication
+                // If followers crash or run slowly, or if network packets are lost,
+                // the leader retries AppendEntries RPCs indefinitely (even after it has responded to the client)
+                // until all followers eventually store all log entries.
                 let result = AppendEntriesResult::from(&res);
                 println!("AppendEntriesResult: {:?}", result);
                 Ok(())

@@ -164,15 +164,44 @@ impl State {
     fn append_log(&mut self, log: Vec<Log>) {
         println!("logs has been appended with the log: {:?}", log);
         for l in log.iter() {
-            self.logs.push(l.clone());
+            // Receiver implementation:
+            // 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it (§5.3)
+            // 4. Append any new entries not already in the log
+            if let Some(conflicted) = self.log_conflicts(&l) {
+                let pos = self.logs.iter().position(|l| {
+                    l.index == conflicted.index && l.term == conflicted.term
+                });
+
+                match pos {
+                    Some(pos) => {
+                        println!("The log has been replaced. from: {:?}, to: {:?}", conflicted, l);
+                        self.logs.remove(pos);
+                        self.logs.insert(pos, l.clone());
+                    }
+                    None => {
+                        // TODO
+                        panic!("Failed to replace_log: couldn't find the `conflicted` Log");
+                    }
+                }
+            } else {
+                assert_eq!(l.index, (self.log_index() + 1));
+                self.logs.push(l.clone());
+            }
         }
 
         println!("state.logs: {:?}", self.logs);
     }
 
     fn log_index(&self) -> u64 {
-        // first index is 1
-        self.logs.len() as u64
+        if self.logs.is_empty() {
+            return 0
+        }
+        self.logs.last().unwrap().index
+    }
+
+    fn prev_log(&self) -> Option<&Log> {
+        let prev_idx = self.logs.len().checked_sub(2)?;
+        self.logs.get(prev_idx)
     }
 
     fn log_term(&self) -> u64 {
@@ -181,6 +210,18 @@ impl State {
         } else {
             self.logs.last().unwrap().term
         }
+    }
+
+    fn has_log(&self, term: u64, index: u64) -> bool {
+        self.logs.iter().any(|l| {
+            l.term == term && l.index == index
+        })
+    }
+
+    fn log_conflicts(&self, log: &Log) -> Option<&Log> {
+        self.logs.iter().find(|l| {
+            l.index == log.index && l.term != log.term
+        })
     }
 }
 
@@ -199,11 +240,24 @@ impl VolatileState {
             last_applied: 0,
         }
     }
+
+    fn increment_commit_index(&mut self) -> u64 {
+        println!("commitIndex has been incremented from {} to {}", self.commit_index, self.commit_index + 1);
+        self.commit_index += 1;
+        self.commit_index
+    }
+
+    fn update_commit_index(&mut self, i: u64) {
+        assert!(i > self.commit_index);
+        println!("commitIndex has been updated from {} to {}", self.commit_index, i);
+        self.commit_index = i;
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Log {
     term: u64,
+    index: u64,
     command: String,
 }
 
@@ -320,7 +374,23 @@ impl RpcHandler {
                 self.server_state.write().unwrap().to_follower();
             }
 
-            state.append_log(append_entries.entries);
+            // empty for heartbeat
+            if !append_entries.entries.is_empty() {
+                state.append_log(append_entries.entries.clone());
+            }
+
+            // Receiver implementation:
+            // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of the last new entry)
+            {
+                let commit_index = self.volatile_state.read().unwrap().commit_index;
+                if append_entries.leader_commit > commit_index {
+                    self.volatile_state.write().unwrap().update_commit_index(
+                        append_entries.leader_commit.min(
+                            append_entries.entries.last().unwrap().index
+                        )
+                    );
+                }
+            }
 
             self.heartbeat_received_at.write().unwrap().reset();
         }
@@ -336,8 +406,20 @@ impl RpcHandler {
 
     fn verify_append_entries(&self, append_entries: &AppendEntries) -> bool {
         let state = self.state.read().unwrap();
-        // Reply false if term < currentTerm (§5.1)
+        // Receiver implementation:
+        // 1. Reply false if term < currentTerm (§5.1)
         if append_entries.term < state.current_term {
+            return false
+        }
+
+        // Heartbeat immediately after an initial election
+        if append_entries.prev_log_term == 0 || append_entries.prev_log_index == 0 {
+            return true
+        }
+
+        // Receiver implementation:
+        // 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+        if !state.has_log(append_entries.prev_log_term, append_entries.prev_log_index) {
             return false
         }
 
@@ -354,13 +436,19 @@ impl RpcHandler {
 
         // If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
         let mut state = self.state.write().unwrap();
-        let log = Log { term: state.current_term, command: message.payload.clone() };
+        let mut volatile_state = self.volatile_state.write().unwrap();
+
+        let log = Log {
+            term: state.current_term,
+            index: volatile_state.increment_commit_index(),
+            command: message.payload.clone()
+        };
         state.append_log(vec![log.clone()]);
 
         let message = RpcMessage::create_append_entries(
             self.node_id.to_string(),
             &state,
-            &self.volatile_state.read().unwrap(),
+            &volatile_state,
             log
         ).to_string();
 
@@ -411,7 +499,7 @@ impl RpcMessage {
                 state.current_term,
                 state.log_index(),
                 state.log_term(),
-                volatile_state,
+                volatile_state.commit_index,
                 vec![]
             )
         ).unwrap();
@@ -425,16 +513,23 @@ impl RpcMessage {
     fn create_append_entries(
         node_id: String,
         state: &RwLockWriteGuard<State>,
-        volatile_state: &RwLockReadGuard<VolatileState>,
+        volatile_state: &RwLockWriteGuard<VolatileState>,
         log: Log
     ) -> Self {
+        let (prev_log_index, prev_log_term) =
+            if let Some(prev_log) = state.prev_log() {
+                (prev_log.index, prev_log.term)
+            } else {
+                (0, 0)
+            };
+
         let payload = serde_json::to_string(
             &AppendEntries::new(
                 node_id,
                 state.current_term,
-                state.log_index(),
-                state.log_term(),
-                volatile_state,
+                prev_log_index,
+                prev_log_term,
+                volatile_state.commit_index,
                 vec![log]
             )
         ).unwrap();
@@ -528,7 +623,7 @@ impl AppendEntries {
         term: u64,
         prev_log_index: u64,
         prev_log_term: u64,
-        volatile_state: &RwLockReadGuard<VolatileState>,
+        leader_commit: u64,
         entries: Vec<Log>
     ) -> Self {
         Self {
@@ -537,7 +632,7 @@ impl AppendEntries {
             prev_log_index,
             prev_log_term,
             entries,
-            leader_commit: volatile_state.commit_index,
+            leader_commit,
         }
     }
 

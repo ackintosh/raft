@@ -857,13 +857,22 @@ impl Heartbeat {
             ).to_string();
 
             for node in self.network.nodes.iter() {
-                self.send_heartbeat(&node, message.as_bytes());
+                let n = node.clone();
+                let m = message.clone();
+                // NOTE:
+                // Detach the threads to avoid cascading issues due to crashed or slow followers
+                std::thread::spawn(move || {
+                    match Self::send_heartbeat(n, m.as_bytes()) {
+                        Ok(_) => {},
+                        Err(e) => println!("{}", e)
+                    }
+                });
             }
         }
     }
 
-    fn send_heartbeat(&self, node: &String, message: &[u8]) -> Result<(), String> {
-        match send_message(node, message) {
+    fn send_heartbeat(node: String, message: &[u8]) -> Result<(), String> {
+        match send_message(&node, message) {
             Ok(res) => {
                 let result = AppendEntriesResult::from(&res);
                 println!("AppendEntriesResult: {:?}", result);

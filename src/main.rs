@@ -257,12 +257,6 @@ impl VolatileState {
         }
     }
 
-    fn increment_commit_index(&mut self) -> u64 {
-        println!("commitIndex has been incremented from {} to {}", self.commit_index, self.commit_index + 1);
-        self.commit_index += 1;
-        self.commit_index
-    }
-
     fn update_commit_index(&mut self, i: u64) {
         assert!(i > self.commit_index);
         println!("commitIndex has been updated from {} to {}", self.commit_index, i);
@@ -273,6 +267,15 @@ impl VolatileState {
         assert_eq!(log.index, self.last_applied + 1);
         println!("lastApplied has been updated from {} to {}", self.last_applied, log.index);
         self.last_applied = log.index;
+    }
+
+    fn update_last_applied_with_commit_index(&mut self) {
+        println!("lastApplied has been updated from {} to {}", self.last_applied, self.commit_index);
+        self.last_applied = self.commit_index;
+    }
+
+    fn applied_index_is_behind(&self) -> bool {
+        self.commit_index > self.last_applied
     }
 }
 
@@ -456,26 +459,37 @@ impl RpcHandler {
             {
                 let commit_index = self.volatile_state.read().unwrap().commit_index;
                 if append_entries.leader_commit > commit_index {
-                    self.volatile_state.write().unwrap().update_commit_index(
-                        append_entries.leader_commit.min(
-                            append_entries.entries.last().unwrap().index
-                        )
-                    );
+                    if append_entries.entries.is_empty() {
+                        self.volatile_state.write().unwrap().update_commit_index(
+                            append_entries.leader_commit
+                        );
+                    } else {
+                        self.volatile_state.write().unwrap().update_commit_index(
+                            append_entries.leader_commit.min(
+                                append_entries.entries.last().unwrap().index
+                            )
+                        );
+                    }
                 }
             }
 
             // empty for heartbeat
             if !append_entries.entries.is_empty() {
                 state.append_log(append_entries.entries.clone());
-
-                // NOTE:
-                // Suppose the follower applies the command to its state machine like below:
-                // state_machine.apply(append_entries.entries)
-
-                self.volatile_state.write().unwrap().update_last_applied(append_entries.entries.last().unwrap());
             }
 
             self.heartbeat_received_at.write().unwrap().reset();
+        }
+
+        // Rules for Servers
+        // All Servers:
+        // If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+        if self.volatile_state.read().unwrap().applied_index_is_behind() {
+            // NOTE:
+            // Suppose the follower applies the command to its state machine like below:
+            // state_machine.apply(log[lastApplied])
+
+            self.volatile_state.write().unwrap().update_last_applied_with_commit_index();
         }
 
         let result = serde_json::to_string(&AppendEntriesResult {
@@ -518,9 +532,10 @@ impl RpcHandler {
         }
 
         // If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
+        let new_log_index = self.volatile_state.read().unwrap().commit_index + 1;
         let log = Log {
             term: self.state.read().unwrap().current_term,
-            index: self.volatile_state.write().unwrap().increment_commit_index(),
+            index: new_log_index.clone(),
             command: message.payload.clone()
         };
         self.state.write().unwrap().append_log(vec![log.clone()]);
@@ -595,7 +610,9 @@ impl RpcHandler {
                 // Suppose the leader applies the command to its state machine like below:
                 // state_machine.apply(log.command)
 
-                self.volatile_state.write().unwrap().update_last_applied(&log);
+                let mut vs = self.volatile_state.write().unwrap();
+                vs.update_commit_index(new_log_index);
+                vs.update_last_applied(&log);
                 stream.write("OK\n".as_bytes()).unwrap();
             }
         }

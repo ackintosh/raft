@@ -83,6 +83,10 @@ impl Network {
     fn is_majority(&self, i: i32) -> bool {
         i >= self.majority
     }
+
+    fn eq_majority(&self, i: i32) -> bool {
+        i == self.majority
+    }
 }
 
 struct ServerState {
@@ -458,24 +462,38 @@ impl RpcHandler {
             log.clone()
         ).to_string();
 
+        // Send AppendEntries RPC in parallel
+        let mut handles = vec![];
         for node in self.network.nodes.iter() {
-            // TODO: send the requests in parallel
-            self.send_append_entries(node, message.as_bytes());
+            let n = node.clone();
+            let m = message.clone();
+            handles.push(
+                std::thread::spawn(move || {
+                    Self::send_append_entries(&n, m.as_bytes());
+                })
+            )
         }
 
         // When the entry has been safely replicated, the leader applies the entry to its state machine and returns the result of that execution to the client.
+        let mut replicated_count = 0;
+        for h in handles {
+            h.join();
+            replicated_count += 1;
 
-        // TODO: A log entry is committed once the leader that created the entry the entry has replicated it on a majority of the servers.
+            // A log entry is committed once the leader that created the entry has replicated it on a majority of the servers.
+            if self.network.eq_majority(replicated_count) {
+                // NOTE:
+                // Suppose the leader applies the command to its state machine like below:
+                // state_machine.apply(log.command)
 
-        // NOTE:
-        // Suppose the leader applies the command to its state machine like below:
-        // state_machine.apply(log.command)
+                volatile_state.update_last_applied(&log);
+                stream.write("OK\n".as_bytes()).unwrap();
+            }
+        }
 
-        volatile_state.update_last_applied(&log);
-        stream.write("OK\n".as_bytes()).unwrap();
     }
 
-    fn send_append_entries(&self, node: &String, message: &[u8]) -> Result<(), String>{
+    fn send_append_entries(node: &String, message: &[u8]) -> Result<(), String>{
         match send_message(node, message) {
             Ok(res) => {
                 // TODO:

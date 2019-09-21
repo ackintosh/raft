@@ -83,6 +83,10 @@ impl Network {
     fn is_majority(&self, i: i32) -> bool {
         i >= self.majority
     }
+
+    fn eq_majority(&self, i: i32) -> bool {
+        i == self.majority
+    }
 }
 
 struct ServerState {
@@ -458,24 +462,38 @@ impl RpcHandler {
             log.clone()
         ).to_string();
 
+        // Send AppendEntries RPC in parallel
+        let mut handles = vec![];
         for node in self.network.nodes.iter() {
-            // TODO: send the requests in parallel
-            self.send_append_entries(node, message.as_bytes());
+            let n = node.clone();
+            let m = message.clone();
+            handles.push(
+                std::thread::spawn(move || {
+                    Self::send_append_entries(&n, m.as_bytes());
+                })
+            )
         }
 
         // When the entry has been safely replicated, the leader applies the entry to its state machine and returns the result of that execution to the client.
+        let mut replicated_count = 0;
+        for h in handles {
+            h.join();
+            replicated_count += 1;
 
-        // TODO: A log entry is committed once the leader that created the entry the entry has replicated it on a majority of the servers.
+            // A log entry is committed once the leader that created the entry has replicated it on a majority of the servers.
+            if self.network.eq_majority(replicated_count) {
+                // NOTE:
+                // Suppose the leader applies the command to its state machine like below:
+                // state_machine.apply(log.command)
 
-        // NOTE:
-        // Suppose the leader applies the command to its state machine like below:
-        // state_machine.apply(log.command)
+                volatile_state.update_last_applied(&log);
+                stream.write("OK\n".as_bytes()).unwrap();
+            }
+        }
 
-        volatile_state.update_last_applied(&log);
-        stream.write("OK\n".as_bytes()).unwrap();
     }
 
-    fn send_append_entries(&self, node: &String, message: &[u8]) -> Result<(), String>{
+    fn send_append_entries(node: &String, message: &[u8]) -> Result<(), String>{
         match send_message(node, message) {
             Ok(res) => {
                 // TODO:
@@ -768,31 +786,40 @@ impl LeaderElection {
             &state
         ).to_string();
 
-        let mut granted_count = 0;
-        for node in self.network.nodes.iter() {
-            // TODO: send the requests in parallel
-            match self.send_request_vote(node, message.as_bytes()) {
-                Ok(granted) => {
-                    if granted {
-                        granted_count += 1;
-                        println!("RequestVote is granted.")
-                    } else {
-                        println!("RequestVote has not granted.")
-                    }
-                }
-                Err(e) => println!("{:?}", e)
-            }
 
-            if self.network.is_majority(granted_count) {
-                return true
+        // Send RequestVote RPC in parallel
+        let mut handles = vec![];
+        for node in self.network.nodes.iter() {
+            let n = node.clone();
+            let m = message.clone();
+            handles.push(
+                std::thread::spawn(move || {
+                    match Self::send_request_vote(n, m.as_bytes()) {
+                        Ok(granted) => granted,
+                        Err(e) => {
+                            println!("{}", e);
+                            false
+                        }
+                    }
+                })
+            );
+        }
+
+        let mut granted_count = 0;
+        for h in handles {
+            if h.join().unwrap_or(false) {
+                granted_count += 1;
+                if self.network.is_majority(granted_count) {
+                    return true
+                }
             }
         }
 
         return false
     }
 
-    fn send_request_vote(&self, node: &String, message: &[u8]) -> Result<bool, String> {
-        match send_message(node, message) {
+    fn send_request_vote(node: String, message: &[u8]) -> Result<bool, String> {
+        match send_message(&node, message) {
             Ok(res) => {
                 let result = RequestVoteResult::from(&res);
                 println!("RequestVoteResult: {:?}", result);
@@ -830,13 +857,22 @@ impl Heartbeat {
             ).to_string();
 
             for node in self.network.nodes.iter() {
-                self.send_heartbeat(&node, message.as_bytes());
+                let n = node.clone();
+                let m = message.clone();
+                // NOTE:
+                // Detach the threads to avoid cascading issues due to crashed or slow followers
+                std::thread::spawn(move || {
+                    match Self::send_heartbeat(n, m.as_bytes()) {
+                        Ok(_) => {},
+                        Err(e) => println!("{}", e)
+                    }
+                });
             }
         }
     }
 
-    fn send_heartbeat(&self, node: &String, message: &[u8]) -> Result<(), String> {
-        match send_message(node, message) {
+    fn send_heartbeat(node: String, message: &[u8]) -> Result<(), String> {
+        match send_message(&node, message) {
             Ok(res) => {
                 let result = AppendEntriesResult::from(&res);
                 println!("AppendEntriesResult: {:?}", result);

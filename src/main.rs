@@ -769,30 +769,39 @@ impl LeaderElection {
         ).to_string();
 
         let mut granted_count = 0;
-        for node in self.network.nodes.iter() {
-            // TODO: send the requests in parallel
-            match self.send_request_vote(node, message.as_bytes()) {
-                Ok(granted) => {
-                    if granted {
-                        granted_count += 1;
-                        println!("RequestVote is granted.")
-                    } else {
-                        println!("RequestVote has not granted.")
-                    }
-                }
-                Err(e) => println!("{:?}", e)
-            }
+        let mut handles = vec![];
 
-            if self.network.is_majority(granted_count) {
-                return true
+        // Send RequestVote RPC in parallel
+        for node in self.network.nodes.iter() {
+            let n = node.clone();
+            let m = message.clone();
+            handles.push(
+                std::thread::spawn(move || {
+                    match Self::send_request_vote(n, m.as_bytes()) {
+                        Ok(granted) => granted,
+                        Err(e) => {
+                            println!("{}", e);
+                            false
+                        }
+                    }
+                })
+            );
+        }
+
+        for h in handles {
+            if h.join().unwrap_or(false) {
+                granted_count += 1;
+                if self.network.is_majority(granted_count) {
+                    return true
+                }
             }
         }
 
         return false
     }
 
-    fn send_request_vote(&self, node: &String, message: &[u8]) -> Result<bool, String> {
-        match send_message(node, message) {
+    fn send_request_vote(node: String, message: &[u8]) -> Result<bool, String> {
+        match send_message(&node, message) {
             Ok(res) => {
                 let result = RequestVoteResult::from(&res);
                 println!("RequestVoteResult: {:?}", result);

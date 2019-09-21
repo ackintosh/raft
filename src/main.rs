@@ -764,11 +764,21 @@ impl LeaderElection {
             let now = Instant::now();
 
             if now > timeout {
+                // Rules for Servers:
+                // Followers (§5.2):
+                // If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
                 println!("Receives no communication over a period `election timeout`.");
+                self.server_state.write().unwrap().to_candidate();
 
                 if self.start_election() {
+                    // If votes received from majority of servers: become leader
                     println!("Received votes from a majority of the servers in the full cluster for the same term.");
                     self.server_state.write().unwrap().to_leader();
+                } else {
+                    // NOTE:
+                    // Change its state to Follower in order to wait for heartbeat(AppendEntries with empty entries) from a new leader.
+                    // If no communication from the new leader, a new election will be started.
+                    self.server_state.write().unwrap().to_follower();
                 }
 
                 println!("Reset the heartbeat_received_at");
@@ -780,12 +790,19 @@ impl LeaderElection {
     }
 
     fn start_election(&self) -> bool {
+        // Rules for Servers:
+        // Candidates (§5.2):
+        // On conversion to candidate, start election:
+        // * Increment currentTerm
+        // * Vote for self
+        // * Reset election timer
+        // * Send RequestVote RPCs to all other servers
         println!("The election has been started");
+
         // To begin an election, a follower increments its current term and transitions to candidate state.
         let mut state = self.state.write().unwrap();
         state.increment_term();
         state.voted_for(&self.node_id);
-        self.server_state.write().unwrap().to_candidate();
 
         let message = RpcMessage::create_request_vote(
             self.node_id.to_string(),

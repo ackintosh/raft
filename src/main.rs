@@ -384,11 +384,6 @@ impl RpcHandler {
                 self.server_state.write().unwrap().to_follower();
             }
 
-            // empty for heartbeat
-            if !append_entries.entries.is_empty() {
-                state.append_log(append_entries.entries.clone());
-            }
-
             // Receiver implementation:
             // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of the last new entry)
             {
@@ -400,6 +395,17 @@ impl RpcHandler {
                         )
                     );
                 }
+            }
+
+            // empty for heartbeat
+            if !append_entries.entries.is_empty() {
+                state.append_log(append_entries.entries.clone());
+
+                // NOTE:
+                // Suppose the follower applies the command to its state machine like below:
+                // state_machine.apply(append_entries.entries)
+
+                self.volatile_state.write().unwrap().update_last_applied(append_entries.entries.last().unwrap());
             }
 
             self.heartbeat_received_at.write().unwrap().reset();

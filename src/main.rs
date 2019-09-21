@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::time::{Instant, Duration};
 use std::sync::{Arc, RwLock, RwLockWriteGuard, RwLockReadGuard};
 use std::ops::Add;
+use std::collections::HashMap;
 
 #[macro_use]
 extern crate serde_derive;
@@ -21,6 +22,7 @@ fn main() {
     let server_state = Arc::new(RwLock::new(ServerState::new()));
     let state = Arc::new(RwLock::new(State::new()));
     let volatile_state = Arc::new(RwLock::new(VolatileState::new()));
+    let volatile_state_on_leader = Arc::new(RwLock::new(VolatileStateOnLeader::new(state.clone(), network.clone())));
 
     let heartbeat_received_at = Arc::new(RwLock::new(HeartbeatReceivedAt::new()));
 
@@ -29,6 +31,7 @@ fn main() {
         network.clone(),
         state.clone(),
         server_state.clone(),
+        volatile_state_on_leader.clone(),
         heartbeat_received_at.clone()
     );
     let _leader_election_handle = std::thread::spawn(move || {
@@ -51,6 +54,7 @@ fn main() {
         state: state.clone(),
         server_state: server_state.clone(),
         volatile_state: volatile_state.clone(),
+        volatile_state_on_leader: volatile_state_on_leader.clone(),
         network: network.clone(),
         heartbeat_received_at: heartbeat_received_at.clone(),
     };
@@ -165,6 +169,14 @@ impl State {
         self.voted_for = Some(node_id.to_string())
     }
 
+    fn logs(&self, start_index: u64) -> Vec<Log> {
+        self.logs.iter().filter(|log| {
+            log.index >= start_index
+        }).map(|log| {
+            log.clone()
+        }).collect()
+    }
+
     fn append_log(&mut self, log: Vec<Log>) {
         println!("logs has been appended with the log: {:?}", log);
         for l in log.iter() {
@@ -245,12 +257,6 @@ impl VolatileState {
         }
     }
 
-    fn increment_commit_index(&mut self) -> u64 {
-        println!("commitIndex has been incremented from {} to {}", self.commit_index, self.commit_index + 1);
-        self.commit_index += 1;
-        self.commit_index
-    }
-
     fn update_commit_index(&mut self, i: u64) {
         assert!(i > self.commit_index);
         println!("commitIndex has been updated from {} to {}", self.commit_index, i);
@@ -261,6 +267,69 @@ impl VolatileState {
         assert_eq!(log.index, self.last_applied + 1);
         println!("lastApplied has been updated from {} to {}", self.last_applied, log.index);
         self.last_applied = log.index;
+    }
+
+    fn update_last_applied_with_commit_index(&mut self) {
+        println!("lastApplied has been updated from {} to {}", self.last_applied, self.commit_index);
+        self.last_applied = self.commit_index;
+    }
+
+    fn applied_index_is_behind(&self) -> bool {
+        self.commit_index > self.last_applied
+    }
+}
+
+// Volatile state on lerders
+// (Reinitialized after election)
+struct VolatileStateOnLeader {
+    state: Arc<RwLock<State>>,
+    network: Arc<Network>,
+    // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+    next_index: HashMap<String, u64>,
+    // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+    match_index: HashMap<String, u64>,
+}
+
+impl VolatileStateOnLeader {
+    fn new(state: Arc<RwLock<State>>, network: Arc<Network>) -> Self {
+        let mut s = Self {
+            state,
+            network,
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
+        };
+        s.initialize();
+        s
+    }
+
+    fn initialize(&mut self) {
+        let last_log_index = self.state.read().unwrap().log_index();
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+        for n in self.network.nodes.iter() {
+            next_index.insert(n.to_string(), last_log_index + 1);
+            match_index.insert(n.to_string(), 0);
+        }
+
+        self.next_index = next_index;
+        self.match_index = match_index;
+        println!("VolatileStateOnLeader has been initialized");
+    }
+
+    fn next_index(&self, node_id: &String) -> &u64 {
+        self.next_index.get(node_id).expect(&format!("{} is not found", node_id))
+    }
+
+    fn match_index(&self, node_id: &String) -> &u64 {
+        self.match_index.get(node_id).expect(&format!("{} is not found", node_id))
+    }
+
+    fn increment_indexes(&mut self, node_id: &String) {
+        println!("nextIndex has been updated from {} to {}", self.next_index(node_id), self.next_index(node_id) + 1);
+        self.next_index.insert(node_id.to_string(), self.next_index(node_id) + 1);
+
+        println!("matchIndex has been updated from {} to {}", self.match_index(node_id), self.match_index(node_id) + 1);
+        self.match_index.insert(node_id.to_string(), self.match_index(node_id) + 1);
     }
 }
 
@@ -276,6 +345,7 @@ struct RpcHandler {
     state: Arc<RwLock<State>>,
     server_state: Arc<RwLock<ServerState>>,
     volatile_state: Arc<RwLock<VolatileState>>,
+    volatile_state_on_leader: Arc<RwLock<VolatileStateOnLeader>>,
     network: Arc<Network>,
     heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
 }
@@ -389,26 +459,37 @@ impl RpcHandler {
             {
                 let commit_index = self.volatile_state.read().unwrap().commit_index;
                 if append_entries.leader_commit > commit_index {
-                    self.volatile_state.write().unwrap().update_commit_index(
-                        append_entries.leader_commit.min(
-                            append_entries.entries.last().unwrap().index
-                        )
-                    );
+                    if append_entries.entries.is_empty() {
+                        self.volatile_state.write().unwrap().update_commit_index(
+                            append_entries.leader_commit
+                        );
+                    } else {
+                        self.volatile_state.write().unwrap().update_commit_index(
+                            append_entries.leader_commit.min(
+                                append_entries.entries.last().unwrap().index
+                            )
+                        );
+                    }
                 }
             }
 
             // empty for heartbeat
             if !append_entries.entries.is_empty() {
                 state.append_log(append_entries.entries.clone());
-
-                // NOTE:
-                // Suppose the follower applies the command to its state machine like below:
-                // state_machine.apply(append_entries.entries)
-
-                self.volatile_state.write().unwrap().update_last_applied(append_entries.entries.last().unwrap());
             }
 
             self.heartbeat_received_at.write().unwrap().reset();
+        }
+
+        // Rules for Servers
+        // All Servers:
+        // If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+        if self.volatile_state.read().unwrap().applied_index_is_behind() {
+            // NOTE:
+            // Suppose the follower applies the command to its state machine like below:
+            // state_machine.apply(log[lastApplied])
+
+            self.volatile_state.write().unwrap().update_last_applied_with_commit_index();
         }
 
         let result = serde_json::to_string(&AppendEntriesResult {
@@ -451,33 +532,70 @@ impl RpcHandler {
         }
 
         // If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
-        let mut state = self.state.write().unwrap();
-        let mut volatile_state = self.volatile_state.write().unwrap();
-
+        let new_log_index = self.volatile_state.read().unwrap().commit_index + 1;
         let log = Log {
-            term: state.current_term,
-            index: volatile_state.increment_commit_index(),
+            term: self.state.read().unwrap().current_term,
+            index: new_log_index.clone(),
             command: message.payload.clone()
         };
-        state.append_log(vec![log.clone()]);
-
-        let message = RpcMessage::create_append_entries(
-            self.node_id.to_string(),
-            &state,
-            &volatile_state,
-            log.clone()
-        ).to_string();
+        self.state.write().unwrap().append_log(vec![log.clone()]);
 
         // Send AppendEntries RPC in parallel
         let mut handles = vec![];
         for node in self.network.nodes.iter() {
-            let n = node.clone();
-            let m = message.clone();
-            handles.push(
-                std::thread::spawn(move || {
-                    Self::send_append_entries(&n, m.as_bytes());
-                })
-            )
+            // If last log index >= nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+            let mut next_index_for_follower = self.volatile_state_on_leader.read().unwrap().next_index(node).clone();
+
+            if log.index >= next_index_for_follower {
+                let node_id = self.node_id.to_string();
+                let follower = node.clone();
+                let state = self.state.clone();
+                let server_state = self.server_state.clone();
+                let volatile_state = self.volatile_state.clone();
+                let volatile_state_on_leader = self.volatile_state_on_leader.clone();
+                handles.push(
+                    std::thread::spawn(move || {
+                        loop {
+                            let message = RpcMessage::create_append_entries(
+                                &node_id,
+                                &state.read().unwrap(),
+                                &volatile_state.read().unwrap(),
+                                next_index_for_follower
+                            ).to_string();
+
+                            // 5.3 Log replication
+                            // If followers crash or run slowly, or if network packets are lost,
+                            // the leader retries AppendEntries RPCs indefinitely (even after it has responded to the client)
+                            // until all followers eventually store all log entries.
+                            match Self::send_append_entries(&follower, message.as_bytes()) {
+                                Ok(append_entries_result) => {
+                                    if append_entries_result.success {
+                                        // If successful: update nextIndex and matchIndex for follower (§5.3)
+                                        volatile_state_on_leader.write().unwrap().increment_indexes(&follower);
+                                    } else {
+                                        if append_entries_result.term > state.read().unwrap().current_term {
+                                            // If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state (§5.1)
+                                            server_state.write().unwrap().to_follower();
+                                        } else {
+                                            // If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
+                                            next_index_for_follower -= 1;
+                                            continue;
+                                        }
+                                    }
+                                    return;
+                                }
+                                Err(e) => {
+                                    println!("Retrying AppendEntries RPC: {}", e);
+                                    // NOTE:
+                                    // Perhaps we should not continue in this case
+                                    // because continuing this loop means to block this thread until the follower has recover.
+                                    continue;
+                                }
+                            }
+                        }
+                    })
+                )
+            }
         }
 
         // When the entry has been safely replicated, the leader applies the entry to its state machine and returns the result of that execution to the client.
@@ -492,28 +610,23 @@ impl RpcHandler {
                 // Suppose the leader applies the command to its state machine like below:
                 // state_machine.apply(log.command)
 
-                volatile_state.update_last_applied(&log);
+                let mut vs = self.volatile_state.write().unwrap();
+                vs.update_commit_index(new_log_index);
+                vs.update_last_applied(&log);
                 stream.write("OK\n".as_bytes()).unwrap();
             }
         }
 
     }
 
-    fn send_append_entries(node: &String, message: &[u8]) -> Result<(), String>{
+    fn send_append_entries(node: &String, message: &[u8]) -> Result<AppendEntriesResult, String>{
         match send_message(node, message) {
             Ok(res) => {
-                // TODO:
-                // 5.3 Log replication
-                // If followers crash or run slowly, or if network packets are lost,
-                // the leader retries AppendEntries RPCs indefinitely (even after it has responded to the client)
-                // until all followers eventually store all log entries.
                 let result = AppendEntriesResult::from(&res);
                 println!("AppendEntriesResult: {:?}", result);
-                Ok(())
+                Ok(result)
             }
-            Err(e) => {
-                Err(format!("Failed to read the AppendEntriesResult: {:?}", e))
-            }
+            Err(e) => Err(format!("Failed to send AppendEntries RPC: {:?}", e))
         }
     }
 }
@@ -557,10 +670,10 @@ impl RpcMessage {
     }
 
     fn create_append_entries(
-        node_id: String,
-        state: &RwLockWriteGuard<State>,
-        volatile_state: &RwLockWriteGuard<VolatileState>,
-        log: Log
+        node_id: &String,
+        state: &RwLockReadGuard<State>,
+        volatile_state: &RwLockReadGuard<VolatileState>,
+        start_index: u64,
     ) -> Self {
         let (prev_log_index, prev_log_term) =
             if let Some(prev_log) = state.prev_log() {
@@ -571,12 +684,12 @@ impl RpcMessage {
 
         let payload = serde_json::to_string(
             &AppendEntries::new(
-                node_id,
+                node_id.to_string(),
                 state.current_term,
                 prev_log_index,
                 prev_log_term,
                 volatile_state.commit_index,
-                vec![log]
+                state.logs(start_index)
             )
         ).unwrap();
 
@@ -728,6 +841,7 @@ struct LeaderElection {
     network: Arc<Network>,
     state: Arc<RwLock<State>>,
     server_state: Arc<RwLock<ServerState>>,
+    volatile_state_on_leader: Arc<RwLock<VolatileStateOnLeader>>,
     election_timeout: Duration,
     heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
 }
@@ -738,6 +852,7 @@ impl LeaderElection {
         network: Arc<Network>,
         state: Arc<RwLock<State>>,
         server_state: Arc<RwLock<ServerState>>,
+        volatile_state_on_leader: Arc<RwLock<VolatileStateOnLeader>>,
         heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
     ) -> Self {
         Self {
@@ -745,6 +860,7 @@ impl LeaderElection {
             network,
             state,
             server_state,
+            volatile_state_on_leader,
             election_timeout: Duration::from_secs(3), // TODO: Randomize per node
             heartbeat_received_at,
         }
@@ -774,6 +890,7 @@ impl LeaderElection {
                     // If votes received from majority of servers: become leader
                     println!("Received votes from a majority of the servers in the full cluster for the same term.");
                     self.server_state.write().unwrap().to_leader();
+                    self.volatile_state_on_leader.write().unwrap().initialize();
                 } else {
                     // NOTE:
                     // Change its state to Follower in order to wait for heartbeat(AppendEntries with empty entries) from a new leader.
@@ -919,21 +1036,13 @@ fn send_message(node: &String, message: &[u8]) -> Result<Box<[u8]>, String> {
 
                     let mut buffer = [0u8; 512];
                     match stream.read(&mut buffer) {
-                        Ok(size) => {
-                            Ok(buffer[..size].to_vec().into_boxed_slice())
-                        }
-                        Err(e) => {
-                            Err(format!("Failed to read the response: {:?}", e))
-                        }
+                        Ok(size) => Ok(buffer[..size].to_vec().into_boxed_slice()),
+                        Err(e) => Err(format!("Failed to read the response: {:?}", e)),
                     }
                 }
-                Err(e) => {
-                    Err(format!("Failed to RequestVote RPC: {:?}", e))
-                }
+                Err(e) => Err(format!("Failed to RequestVote RPC: {:?}", e))
             }
         }
-        Err(e) => {
-            Err(format!("Failed to connect to the node: {:?}, error: {:?}", node, e))
-        }
+        Err(e) => Err(format!("Failed to connect to the node: {:?}, error: {:?}", node, e))
     }
 }

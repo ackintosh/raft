@@ -963,21 +963,13 @@ fn send_message(node: &String, message: &[u8]) -> Result<Box<[u8]>, String> {
 
                     let mut buffer = [0u8; 512];
                     match stream.read(&mut buffer) {
-                        Ok(size) => {
-                            Ok(buffer[..size].to_vec().into_boxed_slice())
-                        }
-                        Err(e) => {
-                            Err(format!("Failed to read the response: {:?}", e))
-                        }
+                        Ok(size) => Ok(buffer[..size].to_vec().into_boxed_slice()),
+                        Err(e) => Err(format!("Failed to read the response: {:?}", e)),
                     }
                 }
-                Err(e) => {
-                    Err(format!("Failed to RequestVote RPC: {:?}", e))
-                }
+                Err(e) => Err(format!("Failed to RequestVote RPC: {:?}", e))
             }
         }
-        Err(e) => {
-            Err(format!("Failed to connect to the node: {:?}, error: {:?}", node, e))
-        }
+        Err(e) => Err(format!("Failed to connect to the node: {:?}, error: {:?}", node, e))
     }
 }

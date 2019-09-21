@@ -31,6 +31,7 @@ fn main() {
         network.clone(),
         state.clone(),
         server_state.clone(),
+        volatile_state_on_leader.clone(),
         heartbeat_received_at.clone()
     );
     let _leader_election_handle = std::thread::spawn(move || {
@@ -767,6 +768,7 @@ struct LeaderElection {
     network: Arc<Network>,
     state: Arc<RwLock<State>>,
     server_state: Arc<RwLock<ServerState>>,
+    volatile_state_on_leader: Arc<RwLock<VolatileStateOnLeader>>,
     election_timeout: Duration,
     heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
 }
@@ -777,6 +779,7 @@ impl LeaderElection {
         network: Arc<Network>,
         state: Arc<RwLock<State>>,
         server_state: Arc<RwLock<ServerState>>,
+        volatile_state_on_leader: Arc<RwLock<VolatileStateOnLeader>>,
         heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
     ) -> Self {
         Self {
@@ -784,6 +787,7 @@ impl LeaderElection {
             network,
             state,
             server_state,
+            volatile_state_on_leader,
             election_timeout: Duration::from_secs(3), // TODO: Randomize per node
             heartbeat_received_at,
         }
@@ -813,6 +817,7 @@ impl LeaderElection {
                     // If votes received from majority of servers: become leader
                     println!("Received votes from a majority of the servers in the full cluster for the same term.");
                     self.server_state.write().unwrap().to_leader();
+                    self.volatile_state_on_leader.write().unwrap().initialize();
                 } else {
                     // NOTE:
                     // Change its state to Follower in order to wait for heartbeat(AppendEntries with empty entries) from a new leader.

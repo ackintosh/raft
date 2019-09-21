@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::time::{Instant, Duration};
 use std::sync::{Arc, RwLock, RwLockWriteGuard, RwLockReadGuard};
 use std::ops::Add;
+use std::collections::HashMap;
 
 #[macro_use]
 extern crate serde_derive;
@@ -21,6 +22,7 @@ fn main() {
     let server_state = Arc::new(RwLock::new(ServerState::new()));
     let state = Arc::new(RwLock::new(State::new()));
     let volatile_state = Arc::new(RwLock::new(VolatileState::new()));
+    let volatile_state_on_leader = Arc::new(RwLock::new(VolatileStateOnLeader::new(state.clone(), network.clone())));
 
     let heartbeat_received_at = Arc::new(RwLock::new(HeartbeatReceivedAt::new()));
 
@@ -261,6 +263,43 @@ impl VolatileState {
         assert_eq!(log.index, self.last_applied + 1);
         println!("lastApplied has been updated from {} to {}", self.last_applied, log.index);
         self.last_applied = log.index;
+    }
+}
+
+// Volatile state on lerders
+// (Reinitialized after election)
+struct VolatileStateOnLeader {
+    state: Arc<RwLock<State>>,
+    network: Arc<Network>,
+    // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+    next_index: HashMap<String, u64>,
+    // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+    match_index: HashMap<String, u64>,
+}
+
+impl VolatileStateOnLeader {
+    fn new(state: Arc<RwLock<State>>, network: Arc<Network>) -> Self {
+        let mut s = Self {
+            state,
+            network,
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
+        };
+        s.initialize();
+        s
+    }
+
+    fn initialize(&mut self) {
+        let last_log_index = self.state.read().unwrap().log_index();
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+        for n in self.network.nodes.iter() {
+            next_index.insert(n.to_string(), last_log_index + 1);
+            match_index.insert(n.to_string(), 0);
+        }
+
+        self.next_index = next_index;
+        self.match_index = match_index;
     }
 }
 

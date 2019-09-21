@@ -702,15 +702,6 @@ impl AppendEntriesResult {
     }
 }
 
-struct LeaderElection {
-    node_id: Arc<String>,
-    network: Arc<Network>,
-    state: Arc<RwLock<State>>,
-    server_state: Arc<RwLock<ServerState>>,
-    election_timeout: Duration,
-    heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
-}
-
 struct HeartbeatReceivedAt {
     value: Instant,
 }
@@ -730,6 +721,15 @@ impl HeartbeatReceivedAt {
         println!("HeartbeatReceivedAt has been updated");
         self.value = Instant::now();
     }
+}
+
+struct LeaderElection {
+    node_id: Arc<String>,
+    network: Arc<Network>,
+    state: Arc<RwLock<State>>,
+    server_state: Arc<RwLock<ServerState>>,
+    election_timeout: Duration,
+    heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
 }
 
 impl LeaderElection {

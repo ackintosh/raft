@@ -768,10 +768,9 @@ impl LeaderElection {
             &state
         ).to_string();
 
-        let mut granted_count = 0;
-        let mut handles = vec![];
 
         // Send RequestVote RPC in parallel
+        let mut handles = vec![];
         for node in self.network.nodes.iter() {
             let n = node.clone();
             let m = message.clone();
@@ -788,6 +787,7 @@ impl LeaderElection {
             );
         }
 
+        let mut granted_count = 0;
         for h in handles {
             if h.join().unwrap_or(false) {
                 granted_count += 1;

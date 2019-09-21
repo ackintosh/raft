@@ -54,6 +54,7 @@ fn main() {
         state: state.clone(),
         server_state: server_state.clone(),
         volatile_state: volatile_state.clone(),
+        volatile_state_on_leader: volatile_state_on_leader.clone(),
         network: network.clone(),
         heartbeat_received_at: heartbeat_received_at.clone(),
     };
@@ -166,6 +167,14 @@ impl State {
 
     fn voted_for(&mut self, node_id: &String) {
         self.voted_for = Some(node_id.to_string())
+    }
+
+    fn logs(&self, start_index: u64) -> Vec<Log> {
+        self.logs.iter().filter(|log| {
+            log.index >= start_index
+        }).map(|log| {
+            log.clone()
+        }).collect()
     }
 
     fn append_log(&mut self, log: Vec<Log>) {
@@ -301,6 +310,23 @@ impl VolatileStateOnLeader {
 
         self.next_index = next_index;
         self.match_index = match_index;
+        println!("VolatileStateOnLeader has been initialized");
+    }
+
+    fn next_index(&self, node_id: &String) -> &u64 {
+        self.next_index.get(node_id).expect(&format!("{} is not found", node_id))
+    }
+
+    fn match_index(&self, node_id: &String) -> &u64 {
+        self.match_index.get(node_id).expect(&format!("{} is not found", node_id))
+    }
+
+    fn increment_indexes(&mut self, node_id: &String) {
+        println!("nextIndex has been updated from {} to {}", self.next_index(node_id), self.next_index(node_id) + 1);
+        self.next_index.insert(node_id.to_string(), self.next_index(node_id) + 1);
+
+        println!("matchIndex has been updated from {} to {}", self.match_index(node_id), self.match_index(node_id) + 1);
+        self.match_index.insert(node_id.to_string(), self.match_index(node_id) + 1);
     }
 }
 
@@ -316,6 +342,7 @@ struct RpcHandler {
     state: Arc<RwLock<State>>,
     server_state: Arc<RwLock<ServerState>>,
     volatile_state: Arc<RwLock<VolatileState>>,
+    volatile_state_on_leader: Arc<RwLock<VolatileStateOnLeader>>,
     network: Arc<Network>,
     heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>
 }
@@ -491,33 +518,69 @@ impl RpcHandler {
         }
 
         // If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
-        let mut state = self.state.write().unwrap();
-        let mut volatile_state = self.volatile_state.write().unwrap();
-
         let log = Log {
-            term: state.current_term,
-            index: volatile_state.increment_commit_index(),
+            term: self.state.read().unwrap().current_term,
+            index: self.volatile_state.write().unwrap().increment_commit_index(),
             command: message.payload.clone()
         };
-        state.append_log(vec![log.clone()]);
-
-        let message = RpcMessage::create_append_entries(
-            self.node_id.to_string(),
-            &state,
-            &volatile_state,
-            log.clone()
-        ).to_string();
+        self.state.write().unwrap().append_log(vec![log.clone()]);
 
         // Send AppendEntries RPC in parallel
         let mut handles = vec![];
         for node in self.network.nodes.iter() {
-            let n = node.clone();
-            let m = message.clone();
-            handles.push(
-                std::thread::spawn(move || {
-                    Self::send_append_entries(&n, m.as_bytes());
-                })
-            )
+            // If last log index >= nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+            let mut next_index_for_follower = self.volatile_state_on_leader.read().unwrap().next_index(node).clone();
+
+            if log.index >= next_index_for_follower {
+                let node_id = self.node_id.to_string();
+                let follower = node.clone();
+                let state = self.state.clone();
+                let server_state = self.server_state.clone();
+                let volatile_state = self.volatile_state.clone();
+                let volatile_state_on_leader = self.volatile_state_on_leader.clone();
+                handles.push(
+                    std::thread::spawn(move || {
+                        loop {
+                            let message = RpcMessage::create_append_entries(
+                                &node_id,
+                                &state.read().unwrap(),
+                                &volatile_state.read().unwrap(),
+                                next_index_for_follower
+                            ).to_string();
+
+                            // 5.3 Log replication
+                            // If followers crash or run slowly, or if network packets are lost,
+                            // the leader retries AppendEntries RPCs indefinitely (even after it has responded to the client)
+                            // until all followers eventually store all log entries.
+                            match Self::send_append_entries(&follower, message.as_bytes()) {
+                                Ok(append_entries_result) => {
+                                    if append_entries_result.success {
+                                        // If successful: update nextIndex and matchIndex for follower (§5.3)
+                                        volatile_state_on_leader.write().unwrap().increment_indexes(&follower);
+                                    } else {
+                                        if append_entries_result.term > state.read().unwrap().current_term {
+                                            // If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state (§5.1)
+                                            server_state.write().unwrap().to_follower();
+                                        } else {
+                                            // If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
+                                            next_index_for_follower -= 1;
+                                            continue;
+                                        }
+                                    }
+                                    return;
+                                }
+                                Err(e) => {
+                                    println!("Retrying AppendEntries RPC: {}", e);
+                                    // NOTE:
+                                    // Perhaps we should not continue in this case
+                                    // because continuing this loop means to block this thread until the follower has recover.
+                                    continue;
+                                }
+                            }
+                        }
+                    })
+                )
+            }
         }
 
         // When the entry has been safely replicated, the leader applies the entry to its state machine and returns the result of that execution to the client.
@@ -532,28 +595,21 @@ impl RpcHandler {
                 // Suppose the leader applies the command to its state machine like below:
                 // state_machine.apply(log.command)
 
-                volatile_state.update_last_applied(&log);
+                self.volatile_state.write().unwrap().update_last_applied(&log);
                 stream.write("OK\n".as_bytes()).unwrap();
             }
         }
 
     }
 
-    fn send_append_entries(node: &String, message: &[u8]) -> Result<(), String>{
+    fn send_append_entries(node: &String, message: &[u8]) -> Result<AppendEntriesResult, String>{
         match send_message(node, message) {
             Ok(res) => {
-                // TODO:
-                // 5.3 Log replication
-                // If followers crash or run slowly, or if network packets are lost,
-                // the leader retries AppendEntries RPCs indefinitely (even after it has responded to the client)
-                // until all followers eventually store all log entries.
                 let result = AppendEntriesResult::from(&res);
                 println!("AppendEntriesResult: {:?}", result);
-                Ok(())
+                Ok(result)
             }
-            Err(e) => {
-                Err(format!("Failed to read the AppendEntriesResult: {:?}", e))
-            }
+            Err(e) => Err(format!("Failed to send AppendEntries RPC: {:?}", e))
         }
     }
 }
@@ -597,10 +653,10 @@ impl RpcMessage {
     }
 
     fn create_append_entries(
-        node_id: String,
-        state: &RwLockWriteGuard<State>,
-        volatile_state: &RwLockWriteGuard<VolatileState>,
-        log: Log
+        node_id: &String,
+        state: &RwLockReadGuard<State>,
+        volatile_state: &RwLockReadGuard<VolatileState>,
+        start_index: u64,
     ) -> Self {
         let (prev_log_index, prev_log_term) =
             if let Some(prev_log) = state.prev_log() {
@@ -611,12 +667,12 @@ impl RpcMessage {
 
         let payload = serde_json::to_string(
             &AppendEntries::new(
-                node_id,
+                node_id.to_string(),
                 state.current_term,
                 prev_log_index,
                 prev_log_term,
                 volatile_state.commit_index,
-                vec![log]
+                state.logs(start_index)
             )
         ).unwrap();
 

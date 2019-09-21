@@ -384,11 +384,6 @@ impl RpcHandler {
                 self.server_state.write().unwrap().to_follower();
             }
 
-            // empty for heartbeat
-            if !append_entries.entries.is_empty() {
-                state.append_log(append_entries.entries.clone());
-            }
-
             // Receiver implementation:
             // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of the last new entry)
             {
@@ -400,6 +395,17 @@ impl RpcHandler {
                         )
                     );
                 }
+            }
+
+            // empty for heartbeat
+            if !append_entries.entries.is_empty() {
+                state.append_log(append_entries.entries.clone());
+
+                // NOTE:
+                // Suppose the follower applies the command to its state machine like below:
+                // state_machine.apply(append_entries.entries)
+
+                self.volatile_state.write().unwrap().update_last_applied(append_entries.entries.last().unwrap());
             }
 
             self.heartbeat_received_at.write().unwrap().reset();
@@ -696,15 +702,6 @@ impl AppendEntriesResult {
     }
 }
 
-struct LeaderElection {
-    node_id: Arc<String>,
-    network: Arc<Network>,
-    state: Arc<RwLock<State>>,
-    server_state: Arc<RwLock<ServerState>>,
-    election_timeout: Duration,
-    heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
-}
-
 struct HeartbeatReceivedAt {
     value: Instant,
 }
@@ -724,6 +721,15 @@ impl HeartbeatReceivedAt {
         println!("HeartbeatReceivedAt has been updated");
         self.value = Instant::now();
     }
+}
+
+struct LeaderElection {
+    node_id: Arc<String>,
+    network: Arc<Network>,
+    state: Arc<RwLock<State>>,
+    server_state: Arc<RwLock<ServerState>>,
+    election_timeout: Duration,
+    heartbeat_received_at: Arc<RwLock<HeartbeatReceivedAt>>,
 }
 
 impl LeaderElection {
@@ -758,11 +764,21 @@ impl LeaderElection {
             let now = Instant::now();
 
             if now > timeout {
+                // Rules for Servers:
+                // Followers (§5.2):
+                // If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
                 println!("Receives no communication over a period `election timeout`.");
+                self.server_state.write().unwrap().to_candidate();
 
                 if self.start_election() {
+                    // If votes received from majority of servers: become leader
                     println!("Received votes from a majority of the servers in the full cluster for the same term.");
                     self.server_state.write().unwrap().to_leader();
+                } else {
+                    // NOTE:
+                    // Change its state to Follower in order to wait for heartbeat(AppendEntries with empty entries) from a new leader.
+                    // If no communication from the new leader, a new election will be started.
+                    self.server_state.write().unwrap().to_follower();
                 }
 
                 println!("Reset the heartbeat_received_at");
@@ -774,12 +790,19 @@ impl LeaderElection {
     }
 
     fn start_election(&self) -> bool {
+        // Rules for Servers:
+        // Candidates (§5.2):
+        // On conversion to candidate, start election:
+        // * Increment currentTerm
+        // * Vote for self
+        // * Reset election timer
+        // * Send RequestVote RPCs to all other servers
         println!("The election has been started");
+
         // To begin an election, a follower increments its current term and transitions to candidate state.
         let mut state = self.state.write().unwrap();
         state.increment_term();
         state.voted_for(&self.node_id);
-        self.server_state.write().unwrap().to_candidate();
 
         let message = RpcMessage::create_request_vote(
             self.node_id.to_string(),
